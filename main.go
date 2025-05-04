@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/schollz/progressbar/v3"
 )
 
 // FileInfo represents information about a file
@@ -21,12 +23,42 @@ type FileInfo struct {
 	MD5Hash      string `json:"md5_hash"`
 }
 
-// scanFiles scans directories recursively and returns file information
+// countFiles counts the total number of files in a directory and its children
+func countFiles(root string) (int, error) {
+	var fileCount int
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	return fileCount, err
+}
+
+// scanFiles scans directories recursively and returns file information with a progress bar
 func scanFiles(root string, workerCount int) ([]FileInfo, error) {
+	fmt.Printf("Counting files in directory: %s\n", root)
+
 	var files []FileInfo
 	var wg sync.WaitGroup
 	fileChan := make(chan FileInfo)
 	errChan := make(chan error)
+
+	// Count total number of files to set up the progress bar
+	totalFiles, err := countFiles(root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count files: %w", err)
+	} else {
+		fmt.Printf("Found %d files\n", totalFiles)
+	}
+
+	fmt.Printf("Scanning directory: %s\n", root)
+
+	// Create a progress bar
+	bar := progressbar.Default(int64(totalFiles))
 
 	// Start worker goroutines
 	for i := 0; i < workerCount; i++ {
@@ -39,7 +71,7 @@ func scanFiles(root string, workerCount int) ([]FileInfo, error) {
 		}()
 	}
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			fmt.Printf("Error accessing path %s: %v\n", path, err)
 			return nil // Continue walking despite errors
@@ -80,6 +112,11 @@ func scanFiles(root string, workerCount int) ([]FileInfo, error) {
 		}
 
 		fileChan <- file
+
+		if err := bar.Add(1); err != nil {
+			fmt.Printf("Progress bar error: %v\n", err)
+		}
+
 		return nil
 	})
 
@@ -136,8 +173,6 @@ func main() {
 	outputFile := flag.String("output", "file_inventory.json", "Output JSON file")
 	workerCount := flag.Int("workers", 10, "Number of worker goroutines")
 	flag.Parse()
-
-	fmt.Printf("Scanning directory: %s\n", *rootDir)
 
 	// Scan files recursively with multiple workers
 	files, err := scanFiles(*rootDir, *workerCount)
