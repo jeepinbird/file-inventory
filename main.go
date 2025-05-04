@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // FileInfo represents information about a file
@@ -21,8 +22,22 @@ type FileInfo struct {
 }
 
 // scanFiles scans directories recursively and returns file information
-func scanFiles(root string) ([]FileInfo, error) {
+func scanFiles(root string, workerCount int) ([]FileInfo, error) {
 	var files []FileInfo
+	var wg sync.WaitGroup
+	fileChan := make(chan FileInfo)
+	errChan := make(chan error)
+
+	// Start worker goroutines
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range fileChan {
+				files = append(files, file)
+			}
+		}()
+	}
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -39,6 +54,7 @@ func scanFiles(root string) ([]FileInfo, error) {
 		hash, err := calculateMD5(path)
 		if err != nil {
 			fmt.Printf("Error calculating MD5 for %s: %v\n", path, err)
+			errChan <- err
 			return nil // Continue despite errors
 		}
 
@@ -49,7 +65,8 @@ func scanFiles(root string) ([]FileInfo, error) {
 		fileInfo, err := os.Stat(path)
 		if err != nil {
 			fmt.Printf("Error getting file stats for %s: %v\n", path, err)
-			return nil
+			errChan <- err
+			return nil // Continue despite errors
 		}
 
 		formattedModTime := fileInfo.ModTime().UTC().Format("2006-01-02T15:04:05Z")
@@ -62,11 +79,24 @@ func scanFiles(root string) ([]FileInfo, error) {
 			MD5Hash:      hash,
 		}
 
-		files = append(files, file)
+		fileChan <- file
 		return nil
 	})
 
-	return files, err
+	close(fileChan)
+	wg.Wait()
+	close(errChan)
+
+	if err != nil {
+		fmt.Printf("Error scanning files: %v\n", err)
+		os.Exit(1)
+	}
+
+	for err := range errChan {
+		fmt.Printf("Worker error: %v\n", err)
+	}
+
+	return files, nil
 }
 
 // calculateMD5 calculates the MD5 hash of a file
@@ -104,12 +134,13 @@ func main() {
 	// Define command line flags
 	rootDir := flag.String("dir", ".", "Directory to scan")
 	outputFile := flag.String("output", "file_inventory.json", "Output JSON file")
+	workerCount := flag.Int("workers", 10, "Number of worker goroutines")
 	flag.Parse()
 
 	fmt.Printf("Scanning directory: %s\n", *rootDir)
 
-	// Scan files recursively
-	files, err := scanFiles(*rootDir)
+	// Scan files recursively with multiple workers
+	files, err := scanFiles(*rootDir, *workerCount)
 	if err != nil {
 		fmt.Printf("Error scanning files: %v\n", err)
 		os.Exit(1)
