@@ -38,7 +38,7 @@ func countFiles(root string) (int, error) {
 			}
 			return err // Propagate other errors
 		}
-		if !info.IsDir() {
+		if !info.IsDir() && info.Mode().IsRegular() {
 			fileCount++
 		}
 		return nil
@@ -52,19 +52,20 @@ func calculateSHA256(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			// Maybe log this, but don't make it a fatal error for the hash
-			fmt.Printf("Warning: error closing file %s: %v\n", filePath, err)
-		}
-	}()
 
 	hash := sha256.New()
-	// Use a buffer potentially? io.Copy usually does this well internally.
-	// buf := make([]byte, 32*1024) // Example buffer
-	// if _, err := io.CopyBuffer(hash, file, buf); err != nil {
-	if _, err := io.Copy(hash, file); err != nil {
+
+	buf := make([]byte, 1024*1024) // 1MB buffer size
+	_, err = io.CopyBuffer(hash, file, buf)
+
+	// Close immediately, don't defer
+	closeErr := file.Close()
+
+	if err != nil {
 		return "", err
+	}
+	if closeErr != nil {
+		return "", closeErr
 	}
 
 	hashInBytes := hash.Sum(nil)
@@ -98,7 +99,7 @@ func main() {
 	fmt.Printf("Counting files in directory: %s...\n", *rootDir)
 	totalFiles, err := countFiles(*rootDir)
 	if err != nil {
-		fmt.Printf("Error counting files: %v\n", err)
+		fmt.Printf("error counting files: %v\n", err)
 		os.Exit(1)
 	}
 	if totalFiles == 0 {
@@ -106,7 +107,7 @@ func main() {
 		// Create an empty JSON array?
 		err := saveToJSON([]FileInfo{}, *outputFile) // Save empty results
 		if err != nil {
-			fmt.Printf("Error saving empty JSON: %v\n", err)
+			fmt.Printf("error saving empty JSON: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("Results saved to %s\n", *outputFile)
@@ -141,7 +142,7 @@ func main() {
 	go func() {
 		defer errorWg.Done()
 		for procErr := range errChan {
-			fmt.Printf("Processing error: %v\n", procErr)
+			fmt.Printf("processing error: %v\n", procErr)
 			errorMutex.Lock()
 			errorCount++
 			errorMutex.Unlock()
@@ -153,7 +154,6 @@ func main() {
 		if err != nil {
 			// Gracefully handle permission errors
 			if os.IsPermission(err) {
-				fmt.Printf("Permission error accessing: %s (skipping)\n", path)
 				// If it's a directory we can't enter, skip its contents
 				if info != nil && info.IsDir() {
 					return filepath.SkipDir
@@ -161,33 +161,14 @@ func main() {
 				return nil // Skip the file if permission error on the file itself
 			}
 			// Report other walk errors but continue if possible
-			fmt.Printf("Error accessing %s: %v (skipping)\n", path, err)
+			fmt.Printf("error accessing %s: %v (skipping)\n", path, err)
 			errChan <- fmt.Errorf("walk error accessing %s: %w", path, err) // Send to *concurrent* reader
 			return nil                                                      // Returning nil tries to continue the walk
 		}
 
-		// Skip directories
-		if info.IsDir() {
+		// Skip directories and non-regular files
+		if info.IsDir() || !info.Mode().IsRegular() {
 			return nil
-		}
-
-		// Skip "special" files
-		fileMode := info.Mode()
-		if fileMode&os.ModeNamedPipe != 0 ||
-			fileMode&os.ModeSocket != 0 ||
-			fileMode&os.ModeDevice != 0 ||
-			fileMode&os.ModeCharDevice != 0 ||
-			fileMode&os.ModeSymlink != 0 { // Also good to skip symlinks or resolve them carefully
-
-			fmt.Printf("Skipping special file or symlink: %s\n", path)
-			// Increment bar since it was counted but won't be processed by a worker.
-			// Ensure bar is thread-safe or handle this carefully.
-			// Since bar.Add is called *inside* the worker's defer now,
-			// we MUST call it here too, otherwise the count will be off.
-			if err := bar.Add(1); err != nil {
-				fmt.Printf("error updating progress bar for skipped file: %v\n", err)
-			}
-			return nil // Skip, don't wg.Add or launch goroutine
 		}
 
 		// --- Process the file concurrently ---
@@ -202,6 +183,10 @@ func main() {
 			defer func() {
 				<-sem
 				wg.Done()
+				// Update progress bar after processing is complete
+				if err := bar.Add(1); err != nil {
+					fmt.Printf("error updating progress bar: %v\n", err)
+				}
 			}()
 
 			// Calculate SHA256 hash
@@ -228,11 +213,6 @@ func main() {
 				SHA256Hash:   hash,
 			}
 			resultsChan <- result
-
-			// Update progress bar after processing is complete
-			if err := bar.Add(1); err != nil {
-				fmt.Printf("error updating progress bar: %v\n", err)
-			}
 
 		}(path, info) // Pass current path and info to the goroutine!
 
