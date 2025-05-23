@@ -7,12 +7,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
-
-	"github.com/schollz/progressbar/v3"
+	"sync/atomic"
+	"time"
 )
 
 // FileInfo struct represents information about a file
@@ -23,27 +27,32 @@ type FileInfo struct {
 	SHA256Hash   string `json:"sha256_hash"`
 }
 
-// countFiles function counts the total number of files in a directory and its children
-func countFiles(root string) (int, error) {
-	var fileCount int
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Handle permission errors gracefully during counting too
-			if os.IsPermission(err) {
-				fmt.Printf("Permission error (count): %s (skipping)\n", path) // Info
-				if info != nil && info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil // Skip file
-			}
-			return err // Propagate other errors
-		}
-		if !info.IsDir() && info.Mode().IsRegular() {
-			fileCount++
-		}
-		return nil
-	})
-	return fileCount, err
+// --- Define files/dirs to skip ---
+var skipNames = map[string]bool{
+	"Docker.raw":                true,
+	".Trash":                    true,
+	".Trash-1000":               true,
+	"$RECYCLE.BIN":              true,
+	"System Volume Information": true,
+	".DocumentRevisions-V100":   true,
+	".fseventsd":                true,
+	".Spotlight-V100":           true,
+	".TemporaryItems":           true,
+	".Trashes":                  true,
+	".git":                      true,
+}
+
+// --- Define paths to skip (prefixes) ---
+var skipPaths = []string{
+	"/dev",
+	"/proc",
+	"/sys",
+}
+
+// PathToProcess struct to send paths AND info to workers
+type PathToProcess struct {
+	Path string
+	Info os.FileInfo
 }
 
 // calculateSHA256 function calculates the SHA256 hash of a file
@@ -58,7 +67,6 @@ func calculateSHA256(filePath string) (string, error) {
 	buf := make([]byte, 1024*1024) // 1MB buffer size
 	_, err = io.CopyBuffer(hash, file, buf)
 
-	// Close immediately, don't defer
 	closeErr := file.Close()
 
 	if err != nil {
@@ -81,176 +89,188 @@ func saveToJSON(files []FileInfo, outputPath string) error {
 	return os.WriteFile(outputPath, jsonData, 0644)
 }
 
-func main() {
-	// Suggest default workers based on CPU count
-	defaultWorkers := runtime.NumCPU()
+// run function contains the main application logic
+func run() int {
+	// --- Flag Parsing ---
+	defaultWorkers := runtime.NumCPU() * 2 // More workers often better for I/O bound
 	if defaultWorkers < 4 {
-		defaultWorkers = 4 // Set a minimum if few cores
+		defaultWorkers = 4
 	}
-
-	// Define command line flags
 	rootDir := flag.String("dir", ".", "Directory to scan")
 	outputFile := flag.String("output", "file_inventory.json", "Output JSON file")
-	// Use the calculated default as the default flag value
 	workerCount := flag.Int("workers", defaultWorkers, "Number of concurrent hashing workers")
 	flag.Parse()
 
-	// --- Count files first for progress bar and slice allocation ---
-	fmt.Printf("Counting files in directory: %s...\n", *rootDir)
-	totalFiles, err := countFiles(*rootDir)
-	if err != nil {
-		fmt.Printf("error counting files: %v\n", err)
-		os.Exit(1)
-	}
-	if totalFiles == 0 {
-		fmt.Println("No files found to process.")
-		// Create an empty JSON array?
-		err := saveToJSON([]FileInfo{}, *outputFile) // Save empty results
-		if err != nil {
-			fmt.Printf("error saving empty JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Results saved to %s\n", *outputFile)
-		os.Exit(0)
-	}
-	fmt.Printf("Found %d files. Starting scan with %d workers...\n", totalFiles, *workerCount)
+	fmt.Printf("Starting scan in %s with %d workers (no pre-count)...\n", *rootDir, *workerCount)
 
-	bar := progressbar.Default(int64(totalFiles))
-
-	// --- Setup Channels and Semaphore ---
-	// Use a semaphore to limit concurrent goroutines for hashing
-	sem := make(chan struct{}, *workerCount)
-	// Buffered channels are good practice here
+	// --- Setup Channels ---
+	pathsChan := make(chan PathToProcess, *workerCount)
 	resultsChan := make(chan FileInfo, *workerCount)
-	errChan := make(chan error, *workerCount) // Collect errors from goroutines
-	var wg sync.WaitGroup                     // To wait for all hashing goroutines
+	errChan := make(chan error, *workerCount*2) // Larger buffer for errors
+	var workersWg sync.WaitGroup
 
-	// --- Goroutine to collect results ---
-	var files = make([]FileInfo, 0, totalFiles) // Pre-allocate slice
+	// --- Setup Progress and Error Counters ---
+	var processedCount int64
+	var errorCount int64
+	var foundCount int64 // Track files found by walk
+
+	// --- Results Collector Goroutine ---
+	var files = make([]FileInfo, 0) // Don't pre-allocate
 	doneCollecting := make(chan struct{})
 	go func() {
+		defer close(doneCollecting)
 		for res := range resultsChan {
 			files = append(files, res)
+			processed := atomic.AddInt64(&processedCount, 1)
+			if processed%1000 == 0 { // Print progress every 1000 files
+				fmt.Printf("... Processed %d files ...\n", processed)
+			}
 		}
-		close(doneCollecting) // Signal that collection is finished
 	}()
 
-	var errorCount int
-	var errorMutex sync.Mutex
-	errorWg := sync.WaitGroup{} // Use WaitGroup
-	errorWg.Add(1)
+	// --- Error Collector Goroutine ---
+	doneErrors := make(chan struct{})
 	go func() {
-		defer errorWg.Done()
-		for procErr := range errChan {
-			fmt.Printf("processing error: %v\n", procErr)
-			errorMutex.Lock()
-			errorCount++
-			errorMutex.Unlock()
+		defer close(doneErrors)
+		for err := range errChan {
+			fmt.Printf("ERROR: %v\n", err) // Print errors as they happen
+			atomic.AddInt64(&errorCount, 1)
 		}
 	}()
 
-	// --- Walk the directory tree (still serial walk, but concurrent processing) ---
+	// --- Worker Goroutines ---
+	for i := 0; i < *workerCount; i++ {
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			for item := range pathsChan {
+				hash, hashErr := calculateSHA256(item.Path)
+				if hashErr != nil {
+					errChan <- fmt.Errorf("hashing %s: %w", item.Path, hashErr)
+					continue
+				}
+
+				dir, fileName := filepath.Split(item.Path)
+				formattedModTime := item.Info.ModTime().UTC().Format("2006-01-02T15:04:05Z")
+
+				resultsChan <- FileInfo{
+					Name:         fileName,
+					Path:         dir,
+					ModifiedDate: formattedModTime,
+					SHA256Hash:   hash,
+				}
+			}
+		}()
+	}
+
+	// --- Walk the directory tree ---
+	fmt.Println("Starting directory walk...")
 	walkErr := filepath.Walk(*rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			// Gracefully handle permission errors
 			if os.IsPermission(err) {
-				// If it's a directory we can't enter, skip its contents
 				if info != nil && info.IsDir() {
 					return filepath.SkipDir
 				}
-				return nil // Skip the file if permission error on the file itself
+				return nil
 			}
-			// Report other walk errors but continue if possible
-			fmt.Printf("error accessing %s: %v (skipping)\n", path, err)
-			errChan <- fmt.Errorf("walk error accessing %s: %w", path, err) // Send to *concurrent* reader
-			return nil                                                      // Returning nil tries to continue the walk
+			errChan <- fmt.Errorf("walk access error at %s: %w", path, err)
+			return nil // Try to continue
 		}
 
-		// Skip directories and non-regular files
-		if info.IsDir() || !info.Mode().IsRegular() {
+		baseName := filepath.Base(path)
+
+		// Check skip names (files or dirs)
+		if skipNames[baseName] {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
-		// --- Process the file concurrently ---
-		wg.Add(1) // Increment counter before starting goroutine
-
-		// Acquire semaphore - this blocks if workerCount goroutines are already running
-		sem <- struct{}{}
-
-		// Launch goroutine to process this file
-		go func(filePath string, fileInfo os.FileInfo) {
-			// Release semaphore and decrement counter when done
-			defer func() {
-				<-sem
-				wg.Done()
-				// Update progress bar after processing is complete
-				if err := bar.Add(1); err != nil {
-					fmt.Printf("error updating progress bar: %v\n", err)
+		// Check skip paths (prefixes)
+		for _, skip := range skipPaths {
+			if strings.HasPrefix(path, skip) {
+				if info.IsDir() {
+					return filepath.SkipDir
 				}
-			}()
-
-			// Calculate SHA256 hash
-			hash, hashErr := calculateSHA256(filePath)
-			if hashErr != nil {
-				// Report error calculating hash
-				errChan <- fmt.Errorf("error hashing %s: %w", filePath, hashErr)
-				// Update progress bar even if there's an error
-				if err := bar.Add(1); err != nil {
-					fmt.Printf("error updating progress bar: %v\n", err)
-				}
-				return // Don't send result if hashing failed
+				return nil
 			}
+		}
 
-			// Extract info (use fileInfo passed in, NO redundant os.Stat)
-			dir, fileName := filepath.Split(filePath)
-			formattedModTime := fileInfo.ModTime().UTC().Format("2006-01-02T15:04:05Z")
+		// Skip directories (after checking if they should be skipped entirely)
+		if info.IsDir() {
+			return nil
+		}
 
-			// Create FileInfo object and send to results channel
-			result := FileInfo{
-				Name:         fileName,
-				Path:         dir,
-				ModifiedDate: formattedModTime,
-				SHA256Hash:   hash,
-			}
-			resultsChan <- result
+		// Skip non-regular files
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 
-		}(path, info) // Pass current path and info to the goroutine!
+		// It's a file to process!
+		atomic.AddInt64(&foundCount, 1)
+		pathsChan <- PathToProcess{Path: path, Info: info}
 
-		return nil // Continue walk
+		return nil
 	})
 
-	// --- Wait for completion and cleanup ---
+	// --- Close pathsChan ONLY when Walk is completely done ---
+	close(pathsChan)
+	fmt.Printf("Directory walk finished. Found %d potential files. Waiting for workers...\n", atomic.LoadInt64(&foundCount))
 
-	// Wait for all file processing goroutines to finish
-	wg.Wait()
+	// --- Wait for workers to finish processing everything in pathsChan ---
+	workersWg.Wait()
+	fmt.Println("Workers finished.")
 
-	// Close channels: No more results or errors will be sent
+	// --- Close other channels to signal collectors ---
 	close(resultsChan)
 	close(errChan)
 
-	// Wait for the results collection goroutine to finish
+	// --- Wait for collectors to finish ---
 	<-doneCollecting
+	<-doneErrors
 
-	errorWg.Wait() // Wait for the error collection goroutine
-
-	// Check for critical error during the walk itself
+	// --- Final Report ---
 	if walkErr != nil {
-		fmt.Printf("Critical error during directory walk: %v\n", walkErr)
-		// Depending on the error, you might still want to save partial results
+		fmt.Printf("Warning: Directory walk encountered a persistent error: %v\n", walkErr)
 	}
 
-	// --- Use errorCount directly ---
-	if errorCount > 0 {
-		fmt.Printf("Encountered %d errors during processing.\n", errorCount)
-	}
+	finalProcessed := atomic.LoadInt64(&processedCount)
+	finalErrors := atomic.LoadInt64(&errorCount)
+	fmt.Printf("\nFinished. Processed %d files with %d errors.\n", finalProcessed, finalErrors)
 
 	// --- Save results ---
-	fmt.Printf("\nProcessed %d files.\n", len(files))
-	err = saveToJSON(files, *outputFile)
+	fmt.Printf("Saving %d results to %s...\n", len(files), *outputFile)
+	err := saveToJSON(files, *outputFile)
 	if err != nil {
-		fmt.Printf("Error saving to JSON: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("FATAL: Error saving to JSON: %v\n", err)
+		return 1
 	}
 
-	fmt.Printf("Results saved to %s\n", *outputFile)
+	fmt.Printf("Results saved successfully.\n")
+	return 0
+}
+
+// main function - sets up pprof, timer and calls run
+func main() {
+	// Start pprof server (useful for debugging hangs/performance)
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	startTime := time.Now() // Record start time
+
+	// Defer the final time print - this will run just before os.Exit
+	defer func() {
+		duration := time.Since(startTime)
+		fmt.Printf("\n-------------------------------\n")
+		fmt.Printf("Total execution time: %v\n", duration)
+		fmt.Printf("-------------------------------\n")
+	}()
+
+	// Call the run function and get the exit code
+	exitCode := run()
+
+	// Exit with the code from run()
+	os.Exit(exitCode)
 }
