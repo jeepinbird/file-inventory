@@ -30,6 +30,7 @@ func countFiles(root string) (int, error) {
 		if err != nil {
 			// Handle permission errors gracefully during counting too
 			if os.IsPermission(err) {
+				fmt.Printf("Permission error (count): %s (skipping)\n", path) // Info
 				if info != nil && info.IsDir() {
 					return filepath.SkipDir
 				}
@@ -72,7 +73,7 @@ func calculateSHA256(filePath string) (string, error) {
 
 // saveToJSON function saves the file information to a JSON file
 func saveToJSON(files []FileInfo, outputPath string) error {
-	jsonData, err := json.MarshalIndent(files, "", "  ") // Use spaces for indent
+	jsonData, err := json.Marshal(files) // Simply Marshal the output
 	if err != nil {
 		return err
 	}
@@ -133,6 +134,20 @@ func main() {
 		close(doneCollecting) // Signal that collection is finished
 	}()
 
+	var errorCount int
+	var errorMutex sync.Mutex
+	errorWg := sync.WaitGroup{} // Use WaitGroup
+	errorWg.Add(1)
+	go func() {
+		defer errorWg.Done()
+		for procErr := range errChan {
+			fmt.Printf("Processing error: %v\n", procErr)
+			errorMutex.Lock()
+			errorCount++
+			errorMutex.Unlock()
+		}
+	}()
+
 	// --- Walk the directory tree (still serial walk, but concurrent processing) ---
 	walkErr := filepath.Walk(*rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -147,13 +162,32 @@ func main() {
 			}
 			// Report other walk errors but continue if possible
 			fmt.Printf("Error accessing %s: %v (skipping)\n", path, err)
-			errChan <- fmt.Errorf("walk error accessing %s: %w", path, err)
-			return nil // Returning nil tries to continue the walk
+			errChan <- fmt.Errorf("walk error accessing %s: %w", path, err) // Send to *concurrent* reader
+			return nil                                                      // Returning nil tries to continue the walk
 		}
 
 		// Skip directories
 		if info.IsDir() {
 			return nil
+		}
+
+		// Skip "special" files
+		fileMode := info.Mode()
+		if fileMode&os.ModeNamedPipe != 0 ||
+			fileMode&os.ModeSocket != 0 ||
+			fileMode&os.ModeDevice != 0 ||
+			fileMode&os.ModeCharDevice != 0 ||
+			fileMode&os.ModeSymlink != 0 { // Also good to skip symlinks or resolve them carefully
+
+			fmt.Printf("Skipping special file or symlink: %s\n", path)
+			// Increment bar since it was counted but won't be processed by a worker.
+			// Ensure bar is thread-safe or handle this carefully.
+			// Since bar.Add is called *inside* the worker's defer now,
+			// we MUST call it here too, otherwise the count will be off.
+			if err := bar.Add(1); err != nil {
+				fmt.Printf("error updating progress bar for skipped file: %v\n", err)
+			}
+			return nil // Skip, don't wg.Add or launch goroutine
 		}
 
 		// --- Process the file concurrently ---
@@ -168,10 +202,6 @@ func main() {
 			defer func() {
 				<-sem
 				wg.Done()
-				// Update progress bar after processing is complete
-				if err := bar.Add(1); err != nil {
-					fmt.Printf("Error updating progress bar: %v\n", err)
-				}
 			}()
 
 			// Calculate SHA256 hash
@@ -179,6 +209,10 @@ func main() {
 			if hashErr != nil {
 				// Report error calculating hash
 				errChan <- fmt.Errorf("error hashing %s: %w", filePath, hashErr)
+				// Update progress bar even if there's an error
+				if err := bar.Add(1); err != nil {
+					fmt.Printf("error updating progress bar: %v\n", err)
+				}
 				return // Don't send result if hashing failed
 			}
 
@@ -194,6 +228,11 @@ func main() {
 				SHA256Hash:   hash,
 			}
 			resultsChan <- result
+
+			// Update progress bar after processing is complete
+			if err := bar.Add(1); err != nil {
+				fmt.Printf("error updating progress bar: %v\n", err)
+			}
 
 		}(path, info) // Pass current path and info to the goroutine!
 
@@ -212,18 +251,15 @@ func main() {
 	// Wait for the results collection goroutine to finish
 	<-doneCollecting
 
+	errorWg.Wait() // Wait for the error collection goroutine
+
 	// Check for critical error during the walk itself
 	if walkErr != nil {
 		fmt.Printf("Critical error during directory walk: %v\n", walkErr)
 		// Depending on the error, you might still want to save partial results
 	}
 
-	// Process any errors collected from goroutines
-	errorCount := 0
-	for procErr := range errChan {
-		fmt.Printf("Processing error: %v\n", procErr)
-		errorCount++
-	}
+	// --- Use errorCount directly ---
 	if errorCount > 0 {
 		fmt.Printf("Encountered %d errors during processing.\n", errorCount)
 	}
